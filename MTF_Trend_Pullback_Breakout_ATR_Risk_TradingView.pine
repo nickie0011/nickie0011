@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 strategy("MTF Trend-Pullback Breakout (ATR Risk & R Targets)",
   overlay=true,
   initial_capital=input.float(10000.0, "Initial Capital", minval=100.0, tooltip="Backtest capital used for risk-based sizing"),
