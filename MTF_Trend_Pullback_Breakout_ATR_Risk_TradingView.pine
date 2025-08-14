@@ -1,0 +1,168 @@
+//@version=5
+strategy("MTF Trend-Pullback Breakout (ATR Risk & R Targets)",
+  overlay=true,
+  initial_capital=input.float(10000.0, "Initial Capital", minval=100.0, tooltip="Backtest capital used for risk-based sizing"),
+  commission_type=strategy.commission.percent,
+  commission_value=input.float(0.05, "Commission (%)", step=0.01, tooltip="0.05 = 0.05% per side"),
+  slippage=input.int(1, "Slippage (ticks)"),
+  calc_on_every_tick=true,
+  process_orders_on_close=false,
+  pyramiding=input.int(0, "Pyramiding", minval=0, maxval=10))
+
+// Direction toggles
+allowLong  = input.bool(true,  "Allow Longs")
+allowShort = input.bool(true,  "Allow Shorts")
+
+// Time/session filters
+sessionInput = input.session("0000-2359", "Trading Session (exchange time)")
+tradeMon = input.bool(true,  "Mon")
+tradeTue = input.bool(true,  "Tue")
+tradeWed = input.bool(true,  "Wed")
+tradeThu = input.bool(true,  "Thu")
+tradeFri = input.bool(true,  "Fri")
+tradeSat = input.bool(true,  "Sat")
+tradeSun = input.bool(true,  "Sun")
+cooldownBars = input.int(3, "Bars Cooldown After Entry", minval=0, tooltip="Minimum bars to wait after an entry before a new entry")
+
+inSession = not na(time(timeframe.period, sessionInput))
+dayOk = (dayofweek == dayofweek.monday   and tradeMon) or
+        (dayofweek == dayofweek.tuesday  and tradeTue) or
+        (dayofweek == dayofweek.wednesday and tradeWed) or
+        (dayofweek == dayofweek.thursday and tradeThu) or
+        (dayofweek == dayofweek.friday   and tradeFri) or
+        (dayofweek == dayofweek.saturday and tradeSat) or
+        (dayofweek == dayofweek.sunday   and tradeSun)
+
+// Higher timeframe trend filter
+htfTf        = input.timeframe("D", "HTF Filter TF")
+emaHTFLen    = input.int(200, "HTF EMA Length", minval=1)
+htfClose     = request.security(syminfo.tickerid, htfTf, close)
+htfEMA       = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaHTFLen))
+htfUp        = htfClose > htfEMA
+htfDown      = htfClose < htfEMA
+
+// Trend & pullback/breakout params
+emaFastLen   = input.int(50,  "EMA Fast", minval=1)
+emaSlowLen   = input.int(200, "EMA Slow", minval=1)
+pbLookback   = input.int(10,  "Pullback Lookback", minval=1, tooltip="Was there a pullback against trend within last N bars?")
+brkLookback  = input.int(20,  "Breakout Lookback", minval=2, tooltip="Break of the previous N bars range")
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+trendUp   = close > emaSlow and emaFast > emaSlow
+trendDown = close < emaSlow and emaFast < emaSlow
+
+pullbackLong  = ta.lowest(low, pbLookback) < emaFast
+pullbackShort = ta.highest(high, pbLookback) > emaFast
+
+longBreakout  = ta.crossover(close, ta.highest(high, brkLookback)[1])
+shortBreakout = ta.crossunder(close, ta.lowest(low, brkLookback)[1])
+
+// Optional RSI pullback filter
+useRSI   = input.bool(false, "Use RSI Filter")
+rsiLen   = input.int(14, "RSI Length", minval=2)
+rsiOB    = input.int(60, "Long: RSI max at pullback", minval=50, maxval=100)
+rsiOS    = input.int(40, "Short: RSI min at pullback", minval=0, maxval=50)
+rsi      = ta.rsi(close, rsiLen)
+rsiOkLong  = not useRSI or (rsi <= rsiOB)
+rsiOkShort = not useRSI or (rsi >= rsiOS)
+
+// Volatility filter
+atrLen   = input.int(14, "ATR Length", minval=1)
+atrMultSL= input.float(2.0, "Stop ATR Multiplier", step=0.1)
+atrMultTR= input.float(3.0, "Trail ATR Multiplier", step=0.1)
+minAtrPct= input.float(0.2, "Min ATR % of Price", step=0.05, tooltip="Skip trades in very low volatility regimes")
+atr      = ta.atr(atrLen)
+atrPct   = atr / close * 100.0
+volOk    = atrPct >= minAtrPct
+
+// Exits: RR target & trailing
+useRRTP      = input.bool(true,  "Use Take-Profit by R Multiple")
+rrTarget     = input.float(2.0,  "Take-Profit R", step=0.1, minval=0.1)
+useTrailing  = input.bool(true,  "Use ATR Trailing Stop")
+
+// Risk sizing
+riskPct      = input.float(1.0, "Risk % per Trade", minval=0.01, step=0.01)
+sizingCapital= input.float(10000.0, "Sizing Capital", minval=100.0, tooltip="Used to compute qty. Not account-equity adaptive.")
+qtyStep      = input.float(1.0, "Quantity Step", minval=0.0001, step=0.0001, tooltip="Round down to this step (e.g., 1 for stocks, 0.001 for crypto)")
+
+riskCurrency = sizingCapital * (riskPct / 100.0)
+
+// Helper: compute position size given stop distance
+f_qtyForRisk(stopDist) =>
+    stopDist <= 0 ? 0.0 : math.max(0.0, (riskCurrency / (stopDist * syminfo.pointvalue)))
+
+f_roundStep(qty, step) =>
+    step <= 0 ? qty : math.floor(qty / step) * step
+
+// Cooldown tracking after entry
+var int lastEntryBar = na
+canEnter = na(lastEntryBar) or (bar_index - lastEntryBar >= cooldownBars)
+
+// Entry conditions
+longCond  = allowLong  and inSession and dayOk and volOk and trendUp   and htfUp   and pullbackLong  and longBreakout  and rsiOkLong  and canEnter and strategy.position_size <= 0
+shortCond = allowShort and inSession and dayOk and volOk and trendDown and htfDown and pullbackShort and shortBreakout and rsiOkShort and canEnter and strategy.position_size >= 0
+
+// Pre-compute stops and qty on signal bars (use close as entry proxy)
+longStopPrice  = close - atrMultSL * atr
+shortStopPrice = close + atrMultSL * atr
+longRiskPerUnit  = close - longStopPrice
+shortRiskPerUnit = shortStopPrice - close
+longQtyRaw   = f_qtyForRisk(longRiskPerUnit)
+shortQtyRaw  = f_qtyForRisk(shortRiskPerUnit)
+longQty      = f_roundStep(longQtyRaw, qtyStep)
+shortQty     = f_roundStep(shortQtyRaw, qtyStep)
+
+// Submit entries
+if longCond and longQty > 0
+    strategy.entry(id="Long", direction=strategy.long, qty=longQty, alert_message="Long Entry")
+    lastEntryBar := bar_index
+
+if shortCond and shortQty > 0
+    strategy.entry(id="Short", direction=strategy.short, qty=shortQty, alert_message="Short Entry")
+    lastEntryBar := bar_index
+
+// Manage exits with dynamic stops/targets
+var float longTrail = na
+var float shortTrail = na
+
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+avgPrice = strategy.position_avg_price
+
+// Long exits
+if inLong
+    // Recompute current risk unit from average price so R target remains stable
+    longUnit = avgPrice - (avgPrice - atrMultSL * atr)
+    longSL   = avgPrice - atrMultSL * atr
+    longTP   = useRRTP and longUnit > 0 ? avgPrice + rrTarget * longUnit : na
+
+    // Trailing stop
+    trailCandidate = close - atrMultTR * atr
+    longTrail := na(longTrail) ? trailCandidate : math.max(longTrail, trailCandidate)
+    exitStop = useTrailing ? math.max(longSL, longTrail) : longSL
+
+    strategy.exit("L-Exit", from_entry="Long", stop=exitStop, limit=longTP, alert_message="Long Exit")
+else
+    longTrail := na
+
+// Short exits
+if inShort
+    shortUnit = (avgPrice + atrMultSL * atr) - avgPrice
+    shortSL   = avgPrice + atrMultSL * atr
+    shortTP   = useRRTP and shortUnit > 0 ? avgPrice - rrTarget * shortUnit : na
+
+    trailCandidateS = close + atrMultTR * atr
+    shortTrail := na(shortTrail) ? trailCandidateS : math.min(shortTrail, trailCandidateS)
+    exitStopS = useTrailing ? math.min(shortSL, shortTrail) : shortSL
+
+    strategy.exit("S-Exit", from_entry="Short", stop=exitStopS, limit=shortTP, alert_message="Short Exit")
+else
+    shortTrail := na
+
+// Visuals
+plot(emaFast,  color=color.new(color.teal,  0), title="EMA Fast")
+plot(emaSlow,  color=color.new(color.orange,0), title="EMA Slow")
+plotchar(longCond,  "Long Signal",  "▲", location.belowbar, color=color.new(color.lime, 0), size=size.tiny)
+plotchar(shortCond, "Short Signal", "▼", location.abovebar, color=color.new(color.red,  0), size=size.tiny)
